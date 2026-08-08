@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <meta name="theme-color" content="#111111">
+  <title>NetMap · Ma cartographie réseau</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;}
+    body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#fafafa;color:#111;}
+    #root{max-width:1140px;margin:0 auto;padding:20px 24px 60px;}
+    :root{
+      --ct:#111;--ct2:#555;--ct3:#999;
+      --cbg1:#fff;--cbg2:#f5f5f4;
+      --cb2:#e0e0e0;--cb3:#ebebeb;
+      --br-md:8px;--br-lg:12px;
+    }
+    select,input,button{font-family:inherit;}
+    ::-webkit-scrollbar{width:6px;height:6px;}
+    ::-webkit-scrollbar-thumb{background:#ddd;border-radius:3px;}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// ─── utils ────────────────────────────────────────────────────────────────────
+function uid() { return Math.random().toString(36).slice(2, 9); }
+const bk = (a, b) => [a, b].sort().join("||");
+const PALETTE = ["#378ADD","#D85A30","#EF9F27","#1D9E75","#9B59B6","#E91E8C","#00BCD4","#FF5722","#607D8B","#795548"];
+const DEF_CLUSTERS = [
+  {id:"cl1",name:"Pro",color:"#378ADD"},
+  {id:"cl2",name:"Famille",color:"#D85A30"},
+  {id:"cl3",name:"Amis",color:"#EF9F27"},
+  {id:"cl4",name:"École",color:"#1D9E75"},
+];
+const ME_ID = "__me__";
+const DEF_CONTACTS = [
+  {id:ME_ID,name:"Moi",role:"",company:"",subCategory:"",cluster:"cl2",priority:0,photo:"",email:"",phone:"",comment:"",conns:[],isMe:true},
+];
+
+// ─── IndexedDB ────────────────────────────────────────────────────────────────
+const DB="netmap_db",ST="state",DK="main";
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open(DB,1);r.onupgradeneeded=e=>e.target.result.createObjectStore(ST);r.onsuccess=e=>res(e.target.result);r.onerror=()=>rej(r.error);});}
+async function dbSave(s){try{const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction(ST,"readwrite");tx.objectStore(ST).put(s,DK);tx.oncomplete=()=>res(true);tx.onerror=()=>rej(tx.error);});}catch{return false;}}
+async function dbLoad(){try{const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction(ST,"readonly");const r=tx.objectStore(ST).get(DK);r.onsuccess=()=>res(r.result||null);r.onerror=()=>rej(r.error);});}catch{return null;}}
+function exportJSON(s){const b=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="netmap-"+new Date().toISOString().slice(0,10)+".json";a.click();URL.revokeObjectURL(u);}
+function snapshotKey(s){return JSON.stringify({clusters:s.clusters,contacts:s.contacts,blacklist:s.blacklist,autoCompany:s.autoCompany,autoCluster:s.autoCluster});}
+function getLastBackupSnap(){try{return localStorage.getItem("nm_last_backup_snap")||"";}catch(e){return window.__nm_lastBackupSnap||"";}}
+function setLastBackupSnap(v){try{localStorage.setItem("nm_last_backup_snap",v);}catch(e){}window.__nm_lastBackupSnap=v;}
+
+// ─── Supabase (synchro cloud multi-appareils) ──────────────────────────────────
+// 1. Crée un projet gratuit sur https://supabase.com
+// 2. Colle ici l'URL du projet et sa clé "anon public" (Project Settings > API)
+// 3. Suis le fichier SETUP.md à la racine du repo pour créer la table + l'utilisateur
+const SUPABASE_URL = "";
+const SUPABASE_ANON_KEY = "";
+const supaClient = (SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
+async function cloudLoad(userId){
+  if(!supaClient)return null;
+  try{
+    const{data,error}=await supaClient.from("netmap_state").select("data").eq("user_id",userId).maybeSingle();
+    if(error||!data)return null;
+    return data.data;
+  }catch{return null;}
+}
+async function cloudSave(userId,state){
+  if(!supaClient)return false;
+  try{
+    const{error}=await supaClient.from("netmap_state").upsert({user_id:userId,data:state,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+    return !error;
+  }catch{return false;}
+}
+
+// ─── Hull helper ──────────────────────────────────────────────────────────────
+function hullPath(pts,pad=28){
+  if(pts.length<2)return null;
+  if(pts.length===2){const[p0,p1]=pts;const cx=(p0[0]+p1[0])/2,cy=(p0[1]+p1[1])/2;const rx=Math.abs(p0[0]-p1[0])/2+pad,ry=Math.abs(p0[1]-p1[1])/2+pad;return `M${cx-rx} ${cy}a${rx} ${ry} 0 1 0 ${rx*2} 0a${rx} ${ry} 0 1 0 ${-rx*2} 0`;}
+  const hull=d3.polygonHull(pts);if(!hull)return null;
+  const cx=d3.mean(hull,p=>p[0]),cy=d3.mean(hull,p=>p[1]);
+  const padded=hull.map(([x,y])=>{const dx=x-cx,dy=y-cy,l=Math.sqrt(dx*dx+dy*dy)||1;return[x+dx/l*pad,y+dy/l*pad];});
+  return "M"+padded.map(p=>p.join(",")).join("L")+"Z";
+}
+
+// ─── Avatar ───────────────────────────────────────────────────────────────────
+function Avatar({photo,color,initials,onChange,size=32}){
+  const ref=useRef();
+  const[drag,setDrag]=useState(false);
+  function handle(f){if(!f?.type?.startsWith("image/"))return;const r=new FileReader();r.onload=e=>onChange(e.target.result);r.readAsDataURL(f);}
+  return (
+    <div onClick={()=>ref.current?.click()}
+      onDragOver={e=>{e.preventDefault();setDrag(true);}}
+      onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{e.preventDefault();setDrag(false);handle(e.dataTransfer.files[0]);}}
+      style={{width:size,height:size,borderRadius:"50%",cursor:"pointer",flexShrink:0,
+        border:`2px ${drag?"solid":"dashed"} ${drag?color:color+"55"}`,
+        background:photo?"transparent":color+"18",overflow:"hidden",
+        display:"flex",alignItems:"center",justifyContent:"center",transition:"border .15s"}}>
+      {photo
+        ? <img src={photo} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+        : <span style={{fontSize:size*.3,fontWeight:700,color,fontFamily:"monospace"}}>{initials}</span>}
+      <input ref={ref} type="file" accept="image/*" style={{display:"none"}} onChange={e=>handle(e.target.files[0])}/>
+    </div>
+  );
+}
+const Tag=({color,children})=>(
+  <span style={{fontSize:10,fontWeight:600,color,background:color+"18",border:`1px solid ${color}40`,borderRadius:99,padding:"1px 7px",whiteSpace:"nowrap"}}>{children}</span>
+);
+function NodeBadge({c,cmap}){
+  const cl=cmap[c.cluster]||{color:"#888"};
+  const ini=c.name.trim().split(/\s+/).map(w=>w[0]).join("").slice(0,2).toUpperCase();
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8,flex:1,minWidth:0}}>
+      {c.photo
+        ?<img src={c.photo} alt="" style={{width:26,height:26,borderRadius:"50%",objectFit:"cover",border:`1.5px solid ${cl.color}`,flexShrink:0}}/>
+        :<div style={{width:26,height:26,borderRadius:"50%",background:cl.color+"20",border:`1.5px solid ${cl.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,color:cl.color,flexShrink:0}}>{ini}</div>}
+      <div style={{minWidth:0}}>
+        <div style={{fontSize:13,fontWeight:500,color:"var(--ct)",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{c.name}</div>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",alignItems:"center"}}>
+          {c.role&&<Tag color={cl.color}>{c.role}</Tag>}
+          {c.company&&<Tag color="#378ADD">{c.company}</Tag>}
+          {c.comment&&<span title={c.comment} style={{fontSize:11,cursor:"help",opacity:.75}}>📝</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+function StarRating({val=0,onChange,size=13}){
+  return (
+    <div style={{display:"flex",gap:1}}>
+      {[1,2,3,4,5].map(n=>(
+        <span key={n} onClick={e=>{e.stopPropagation();onChange(val===n?0:n);}}
+          style={{cursor:"pointer",fontSize:size,lineHeight:1,color:n<=val?"#EF9F27":"var(--cb2)",userSelect:"none"}}>★</span>
+      ))}
+    </div>
+  );
+}
+function Toggle({val,onChange,label}){
+  return (
+    <button onClick={()=>onChange(!val)} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 12px",border:`1px solid ${val?"var(--cb2)":"var(--cb3)"}`,borderRadius:"var(--br-md)",background:val?"var(--cbg1)":"transparent",fontSize:12,cursor:"pointer",color:val?"var(--ct)":"var(--ct3)",fontFamily:"inherit",transition:"all .12s"}}>
+      <div style={{width:28,height:14,borderRadius:99,background:val?"#378ADD":"var(--cb2)",position:"relative",transition:"background .15s",flexShrink:0}}>
+        <div style={{width:10,height:10,borderRadius:"50%",background:"#fff",position:"absolute",top:2,left:val?16:2,transition:"left .15s",boxShadow:"0 .5px 2px rgba(0,0,0,.25)"}}/>
+      </div>
+      {label}
+    </button>
+  );
+}
+
+// ─── MapView ──────────────────────────────────────────────────────────────────
+const MAP_H=[380,480,540,660,780];
+function MapView({gdata,cmap}){
+  const svgRef=useRef(null);
+  const wrapRef=useRef(null);
+  const simRef=useRef(null);
+  const[sel,setSel]=useState(null);
+  const[panel,setPanel]=useState(true);
+  const[hidx,setHidx]=useState(2);
+  const[layoutMode,setLayoutMode]=useState("force");
+  const H=MAP_H[hidx];
+
+  useEffect(()=>{
+    if(!svgRef.current||!wrapRef.current)return;
+    const W=wrapRef.current.clientWidth||720;
+    const{nodes,links}=gdata;
+    const svg=d3.select(svgRef.current);
+    svg.selectAll("*").remove();
+    const defs=svg.append("defs");
+    nodes.forEach(n=>{
+      if(!n.photo)return;
+      defs.append("pattern").attr("id","ph-"+n.id)
+        .attr("patternUnits","objectBoundingBox").attr("width",1).attr("height",1)
+        .append("image").attr("href",n.photo).attr("width",64).attr("height",64)
+        .attr("preserveAspectRatio","xMidYMid slice");
+    });
+    const g=svg.append("g");
+    svg.call(d3.zoom().scaleExtent([.05,8]).on("zoom",e=>g.attr("transform",e.transform)));
+    const sn=nodes.map(n=>({...n,fx:n.isMe?W/2:null,fy:n.isMe?H/2:null}));
+    const sl=links.map(l=>({...l}));
+    const sim=d3.forceSimulation(sn)
+      .force("link",d3.forceLink(sl).id(d=>d.id).distance(d=>d.type==="cluster"?200:140).strength(.5))
+      .force("charge",d3.forceManyBody().strength(-600))
+      .force("center",d3.forceCenter(W/2,H/2))
+      .force("collision",d3.forceCollide(70));
+    simRef.current={sim,nodes:sn,W,H};
+
+    const hullG=g.append("g");
+    const linkEl=g.append("g").selectAll("line").data(sl).join("line")
+      .attr("stroke",d=>d.type==="manual"?"#444":d.type==="company"?"#378ADD":"#EF9F27")
+      .attr("stroke-width",d=>d.type==="manual"?2:1)
+      .attr("stroke-dasharray",d=>d.type==="cluster"?"5 4":"none")
+      .attr("opacity",d=>d.type==="manual"?.8:.35);
+    const lblEl=g.append("g").selectAll("text").data(sl.filter(l=>l.type==="manual")).join("text")
+      .text("↔").attr("text-anchor","middle").attr("dominant-baseline","central")
+      .attr("fill","#555").attr("font-size",9).attr("opacity",.5);
+    const nodeEl=g.append("g").selectAll("g").data(sn).join("g").style("cursor","grab")
+      .call(d3.drag()
+        .on("start",(e,d)=>{d._dragged=false;if(!d.isMe){if(!e.active)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y;}})
+        .on("drag",(e,d)=>{d._dragged=true;if(!d.isMe){d.fx=e.x;d.fy=e.y;}})
+        .on("end",(e,d)=>{if(!d.isMe){if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null;}})
+      )
+      .on("click",(e,d)=>{
+        e.stopPropagation();
+        if(d._dragged)return;
+        setSel(gdata.nodes.find(n=>n.id===d.id)||d);
+        setPanel(true);
+      });
+    nodeEl.each(function(d){
+      const el=d3.select(this);
+      const cl=cmap[d.cluster]||{color:"#888"};
+      const R=d.isMe?30:22;
+      if(d.isMe){
+        el.append("circle").attr("r",R+13).attr("fill","none").attr("stroke",cl.color).attr("stroke-width",1).attr("stroke-dasharray","4 4").attr("opacity",.2);
+        el.append("circle").attr("r",R+7).attr("fill",cl.color+"0B").attr("stroke",cl.color).attr("stroke-width",.5).attr("opacity",.4);
+      }
+      el.append("circle").attr("r",R)
+        .attr("fill",d.photo?"url(#ph-"+d.id+")":cl.color+"20")
+        .attr("stroke",cl.color).attr("stroke-width",d.isMe?2.5:1.5);
+      if(!d.photo)
+        el.append("text").text(d.name.trim().split(/\s+/).map(w=>w[0]).join("").slice(0,2).toUpperCase())
+          .attr("text-anchor","middle").attr("dominant-baseline","central")
+          .attr("fill",cl.color).attr("font-size",d.isMe?13:10).attr("font-weight",700).attr("font-family","monospace");
+      el.append("text").text(d.name).attr("text-anchor","middle").attr("y",R+14)
+        .attr("fill","var(--ct)").attr("font-size",11).attr("font-weight",d.isMe?600:400).attr("font-family","inherit");
+      if(d.role)el.append("text").text(d.role).attr("text-anchor","middle").attr("y",R+25).attr("fill",cl.color).attr("font-size",9).attr("opacity",.85).attr("font-family","inherit");
+      if(d.company)el.append("text").text(d.company).attr("text-anchor","middle").attr("y",R+36).attr("fill","#378ADD").attr("font-size",8).attr("opacity",.7).attr("font-family","inherit");
+    });
+    sim.on("tick",()=>{
+      linkEl.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y).attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+      lblEl.attr("x",d=>(d.source.x+d.target.x)/2).attr("y",d=>(d.source.y+d.target.y)/2-7);
+      nodeEl.attr("transform",d=>"translate("+d.x+","+d.y+")");
+      hullG.selectAll("*").remove();
+      // cluster hulls
+      const byC={};
+      sn.forEach(n=>{if(!byC[n.cluster])byC[n.cluster]=[];byC[n.cluster].push([n.x,n.y]);});
+      Object.entries(byC).forEach(([cid,pts])=>{
+        if(pts.length<3)return;
+        const cl=cmap[cid];if(!cl)return;
+        const path=hullPath(pts,32);if(!path)return;
+        hullG.append("path").attr("d",path).attr("fill",cl.color+"12").attr("stroke",cl.color).attr("stroke-width",1.2).attr("stroke-dasharray","6 4").attr("opacity",.7);
+        hullG.append("text").text(cl.name).attr("x",d3.mean(pts,p=>p[0])).attr("y",d3.min(pts,p=>p[1])-14).attr("text-anchor","middle").attr("fill",cl.color).attr("font-size",10).attr("font-weight",600).attr("opacity",.65).attr("font-family","inherit");
+      });
+      // company hulls
+      const byO={};
+      sn.forEach(n=>{if(!n.company?.trim())return;if(!byO[n.company])byO[n.company]=[];byO[n.company].push([n.x,n.y]);});
+      Object.entries(byO).forEach(([co,pts])=>{
+        if(pts.length<3)return;
+        const path=hullPath(pts,40);if(!path)return;
+        hullG.append("path").attr("d",path).attr("fill","#378ADD08").attr("stroke","#378ADD").attr("stroke-width",1).attr("opacity",.5);
+        hullG.append("text").text(co).attr("x",d3.mean(pts,p=>p[0])).attr("y",d3.max(pts,p=>p[1])+46).attr("text-anchor","middle").attr("fill","#378ADD").attr("font-size",9).attr("font-weight",600).attr("opacity",.6).attr("font-family","inherit");
+      });
+    });
+    return()=>sim.stop();
+  },[gdata,cmap,H]);
+
+  function reorganize(mode){
+    if(!simRef.current)return;
+    const{sim,nodes:sn,W,H}=simRef.current;
+    if(mode==="force"){
+      sn.forEach(d=>{if(!d.isMe){d.fx=null;d.fy=null;}});
+      sim.alpha(1).restart();
+    } else if(mode==="circle"){
+      const n=sn.length;
+      sn.forEach((d,i)=>{
+        if(d.isMe){d.fx=W/2;d.fy=H/2;return;}
+        const a=(2*Math.PI*i)/n;
+        const r=Math.min(W,H)*.32;
+        d.x=W/2+r*Math.cos(a);d.y=H/2+r*Math.sin(a);
+        d.fx=d.x;d.fy=d.y;
+      });
+      sim.alpha(.3).restart();
+    } else if(mode==="cluster"){
+      const groups={};
+      sn.forEach(d=>{if(!groups[d.cluster])groups[d.cluster]=[];groups[d.cluster].push(d);});
+      const gk=Object.keys(groups);
+      const cols=Math.ceil(Math.sqrt(gk.length));
+      gk.forEach((cid,gi)=>{
+        const col=gi%cols,row=Math.floor(gi/cols);
+        const cx=W*(0.15+col*(0.7/Math.max(cols-1,1)));
+        const cy=H*(0.15+row*(0.7/Math.max(Math.ceil(gk.length/cols)-1,1)));
+        groups[cid].forEach((d,i)=>{
+          if(d.isMe){d.fx=W/2;d.fy=H/2;return;}
+          const a=(2*Math.PI*i)/groups[cid].length;
+          const r=40+groups[cid].length*12;
+          d.x=cx+r*Math.cos(a);d.y=cy+r*Math.sin(a);
+          d.fx=null;d.fy=null;
+        });
+      });
+      sim.alpha(1).restart();
+    }
+    setLayoutMode(mode);
+  }
+
+  // Detail panel
+  function DetailPanel(){
+    if(!sel||!sel.name)return(
+      <div style={{width:230,flexShrink:0,border:"0.5px dashed var(--cb3)",borderRadius:"var(--br-lg)",display:"flex",alignItems:"center",justifyContent:"center",height:H,color:"var(--ct3)",fontSize:12,textAlign:"center",padding:"0 20px"}}>
+        Clique sur un nœud pour voir ses infos
+      </div>
+    );
+    const cl=cmap[sel.cluster]||{color:"#888",name:"—"};
+    const conns=(sel.conns||[]).map(id=>gdata.nodes.find(n=>n.id===id)).filter(Boolean);
+    const ini=sel.name.trim().split(/\s+/).map(w=>w[0]).join("").slice(0,2).toUpperCase();
+    return (
+      <div style={{width:230,flexShrink:0,border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",background:"var(--cbg1)",display:"flex",flexDirection:"column",overflow:"hidden",height:H}}>
+        <div style={{background:cl.color+"18",borderBottom:`2px solid ${cl.color}30`,padding:"14px 14px 10px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            {sel.photo
+              ?<img src={sel.photo} alt="" style={{width:44,height:44,borderRadius:"50%",objectFit:"cover",border:`2px solid ${cl.color}`,flexShrink:0}}/>
+              :<div style={{width:44,height:44,borderRadius:"50%",background:cl.color+"25",border:`2px solid ${cl.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:700,color:cl.color,flexShrink:0}}>{ini}</div>}
+            <div style={{minWidth:0}}>
+              <div style={{fontWeight:700,fontSize:14,color:"var(--ct)",lineHeight:1.2}}>{sel.name}</div>
+              {sel.role&&<div style={{fontSize:11,color:cl.color,marginTop:2}}>{sel.role}</div>}
+            </div>
+          </div>
+        </div>
+        <div style={{flex:1,overflowY:"auto",padding:"10px 14px",display:"flex",flexDirection:"column",gap:9}}>
+          {sel.company&&<div style={{display:"flex",gap:8}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Entreprise</span><span style={{fontSize:13,color:"var(--ct)",fontWeight:500}}>{sel.company}</span></div>}
+          {sel.subCategory&&<div style={{display:"flex",gap:8}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Sous-cat.</span><span style={{fontSize:13,color:"var(--ct)"}}>{sel.subCategory}</span></div>}
+          <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Cluster</span><span style={{fontSize:11,fontWeight:600,color:cl.color,background:cl.color+"18",border:`1px solid ${cl.color}35`,borderRadius:99,padding:"1px 8px"}}>{cl.name}</span></div>
+          {sel.priority>0&&<div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Importance</span><StarRating val={sel.priority} onChange={()=>{}} size={12}/></div>}
+          {sel.email&&<div style={{display:"flex",gap:8}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Email</span><a href={"mailto:"+sel.email} style={{fontSize:12,color:"#378ADD",textDecoration:"none",wordBreak:"break-all"}}>{sel.email}</a></div>}
+          {sel.phone&&<div style={{display:"flex",gap:8}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0}}>Tél.</span><a href={"tel:"+sel.phone} style={{fontSize:12,color:"#378ADD",textDecoration:"none"}}>{sel.phone}</a></div>}
+          {sel.comment&&<div style={{display:"flex",gap:8,alignItems:"flex-start"}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0,paddingTop:1}}>Notes</span><span style={{fontSize:12,color:"var(--ct)",whiteSpace:"pre-wrap",lineHeight:1.4}}>{sel.comment}</span></div>}
+          {conns.length>0&&<div style={{display:"flex",gap:8,alignItems:"flex-start"}}><span style={{fontSize:11,color:"var(--ct3)",width:70,flexShrink:0,paddingTop:3}}>Liens</span>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              {conns.map(c=>{
+                const cc=cmap[c.cluster]||{color:"#888"};
+                const ci=c.name.trim().split(/\s+/).map(w=>w[0]).join("").slice(0,2).toUpperCase();
+                return(
+                  <div key={c.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={e=>{e.stopPropagation();setSel(c);}}>
+                    {c.photo?<img src={c.photo} alt="" style={{width:20,height:20,borderRadius:"50%",objectFit:"cover",border:`1.5px solid ${cc.color}`,flexShrink:0}}/>
+                    :<div style={{width:20,height:20,borderRadius:"50%",background:cc.color+"20",border:`1.5px solid ${cc.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:7,fontWeight:700,color:cc.color,flexShrink:0}}>{ci}</div>}
+                    <span style={{fontSize:12,color:"var(--ct)"}}>{c.name}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>}
+        </div>
+        <div style={{padding:"8px 14px",borderTop:"0.5px solid var(--cb3)",display:"flex",justifyContent:"flex-end"}}>
+          <button onClick={()=>setSel(null)} style={{border:"0.5px solid var(--cb2)",background:"none",borderRadius:6,padding:"3px 10px",fontSize:11,color:"var(--ct3)",cursor:"pointer",fontFamily:"inherit"}}>Fermer</button>
+        </div>
+      </div>
+    );
+  }
+
+  const activeCl=[...new Set(gdata.nodes.map(n=>n.cluster))].map(id=>cmap[id]).filter(Boolean);
+  const hasManual=gdata.links.some(l=>l.type==="manual");
+  const hasCompany=gdata.links.some(l=>l.type==="company");
+  const hasCluster=gdata.links.some(l=>l.type==="cluster");
+  const btnBase={padding:"4px 9px",border:"0.5px solid var(--cb2)",borderRadius:5,fontSize:11,cursor:"pointer",fontFamily:"inherit",transition:"all .12s"};
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {/* toolbar */}
+      <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+        <button onClick={()=>setPanel(p=>!p)}
+          style={{...btnBase,background:panel?"var(--ct)":"transparent",color:panel?"var(--cbg1)":"var(--ct2)",display:"flex",alignItems:"center",gap:5}}>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x=".5" y=".5" width="11" height="11" rx="1.5" stroke="currentColor" strokeWidth="1"/><line x1="8" y1=".5" x2="8" y2="11.5" stroke="currentColor" strokeWidth="1"/></svg>
+          {panel?"Panneau ouvert":"Panneau fermé"}
+        </button>
+        <div style={{display:"flex",alignItems:"center",gap:5}}>
+          <span style={{fontSize:11,color:"var(--ct3)"}}>Hauteur</span>
+          {MAP_H.map((h,i)=><button key={i} onClick={()=>setHidx(i)}
+            style={{...btnBase,width:26,height:22,padding:0,background:hidx===i?"var(--ct)":"transparent",color:hidx===i?"var(--cbg1)":"var(--ct3)"}}>
+            {["XS","S","M","L","XL"][i]}
+          </button>)}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:5}}>
+          <span style={{fontSize:11,color:"var(--ct3)"}}>Disposition</span>
+          {[["force","⟳ Auto"],["circle","◎ Cercle"],["cluster","⬡ Cluster"]].map(([m,lbl])=>(
+            <button key={m} onClick={()=>reorganize(m)}
+              style={{...btnBase,background:layoutMode===m?"var(--ct)":"transparent",color:layoutMode===m?"var(--cbg1)":"var(--ct2)",whiteSpace:"nowrap"}}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+      </div>
+      {/* map + panel */}
+      <div style={{display:"flex",gap:12}}>
+        <div ref={wrapRef} onClick={()=>setSel(null)}
+          style={{position:"relative",flex:1,border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",overflow:"hidden",background:"var(--cbg2)"}}>
+          {gdata.nodes.length===0
+            ?<div style={{height:H,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--ct3)",fontSize:13}}>Ajoutez des contacts pour afficher la carte</div>
+            :<svg ref={svgRef} width="100%" height={H}/>}
+          {/* legend */}
+          <div style={{position:"absolute",bottom:10,left:10,display:"flex",flexDirection:"column",gap:4}}>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+              {activeCl.map(cl=><div key={cl.id} style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:"var(--ct2)",background:"var(--cbg1)",padding:"2px 7px",borderRadius:99,border:"0.5px solid var(--cb3)"}}><div style={{width:6,height:6,borderRadius:"50%",background:cl.color}}/>{cl.name}</div>)}
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+              {hasManual&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:"var(--ct2)",background:"var(--cbg1)",padding:"2px 7px",borderRadius:99,border:"0.5px solid var(--cb3)"}}><svg width="16" height="6"><line x1="0" y1="3" x2="16" y2="3" stroke="#444" strokeWidth="2"/></svg>Manuel</div>}
+              {hasCompany&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:"var(--ct2)",background:"var(--cbg1)",padding:"2px 7px",borderRadius:99,border:"0.5px solid var(--cb3)"}}><svg width="16" height="6"><line x1="0" y1="3" x2="16" y2="3" stroke="#378ADD" strokeWidth="1.5"/></svg>Entreprise</div>}
+              {hasCluster&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:"var(--ct2)",background:"var(--cbg1)",padding:"2px 7px",borderRadius:99,border:"0.5px solid var(--cb3)"}}><svg width="16" height="6"><line x1="0" y1="3" x2="16" y2="3" stroke="#EF9F27" strokeWidth="1" strokeDasharray="4 3"/></svg>Cluster</div>}
+            </div>
+          </div>
+          <div style={{position:"absolute",top:8,right:10,fontSize:11,color:"var(--ct3)"}}>Glisser · Molette pour zoomer</div>
+        </div>
+        {panel&&<DetailPanel/>}
+      </div>
+    </div>
+  );
+}
+
+// ─── ImportView ───────────────────────────────────────────────────────────────
+function ImportView({contacts,setContacts,clusters}){
+  const[rows,setRows]=useState(null);
+  const[headers,setHeaders]=useState([]);
+  const[mapping,setMapping]=useState({name:"",role:"",company:"",subCategory:"",cluster:"",priority:"",email:"",phone:"",comment:"",connections:""});
+  const[dragI,setDragI]=useState(false);
+  const[result,setResult]=useState(null);
+  const ref=useRef(null);
+  function parse(f){
+    if(!f)return;setResult(null);
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const wb=XLSX.read(e.target.result,{type:"binary"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+        if(!data.length)return;
+        const hdrs=data[0].map(String);
+        setHeaders(hdrs);setRows(data.slice(1).filter(r=>r.some(c=>String(c).trim())));
+        const m={name:"",lastName:"",role:"",company:"",subCategory:"",cluster:"",priority:"",email:"",phone:"",comment:"",connections:""};
+        // split first-name/last-name export (e.g. LinkedIn "First Name" + "Last Name"): merge into one full name
+        const firstH=hdrs.find(h=>/^(first ?name|prénom|prenom)$/i.test(h.trim()));
+        const lastH=hdrs.find(h=>/^(last ?name|surname|nom)$/i.test(h.trim()));
+        if(firstH&&lastH){m.name=firstH;m.lastName=lastH;}
+        hdrs.forEach(h=>{if(h===firstH||h===lastH)return;const l=h.toLowerCase();
+          if(!m.name&&/^(nom|name|prénom|prenom)/.test(l))m.name=h;
+          else if(!m.role&&/rôle|role|poste|fonction|position/.test(l))m.role=h;
+          else if(!m.company&&/entreprise|société|company|org/.test(l))m.company=h;
+          else if(!m.subCategory&&/secteur|sous-cat|sous cat|subcateg|industry/.test(l))m.subCategory=h;
+          else if(!m.cluster&&/cluster|groupe|catégorie/.test(l))m.cluster=h;
+          else if(!m.priority&&/priorit|importance/.test(l))m.priority=h;
+          else if(!m.email&&/email|mail/.test(l))m.email=h;
+          else if(!m.phone&&/tél|tel|phone|mobile/.test(l))m.phone=h;
+          else if(!m.comment&&/commentaire|comment|note|remarque/.test(l))m.comment=h;
+          else if(!m.connections&&/conn|lien/.test(l))m.connections=h;
+        });setMapping(m);
+      }catch(e){}
+    };reader.readAsBinaryString(f);
+  }
+  function doImport(){
+    if(!rows||!mapping.name)return;
+    const gi=h=>headers.indexOf(h);
+    const get=(row,field)=>{const i=gi(mapping[field]);return i>=0?String(row[i]??"").trim():"";};
+    const ni=gi(mapping.name);
+    const li=gi(mapping.lastName);
+    const newC=rows.map(row=>{
+      const first=String(row[ni]??"").trim();
+      const last=li>=0?String(row[li]??"").trim():"";
+      const name=[first,last].filter(Boolean).join(" ");
+      if(!name)return null;
+      const clName=get(row,"cluster");const mc=clusters.find(cl=>cl.name.toLowerCase()===clName.toLowerCase());
+      const prio=parseInt(get(row,"priority"),10);
+      return{id:uid(),name,role:get(row,"role"),company:get(row,"company"),subCategory:get(row,"subCategory"),cluster:mc?.id||clusters[0]?.id,priority:Number.isFinite(prio)?Math.max(0,Math.min(5,prio)):0,email:get(row,"email"),phone:get(row,"phone"),comment:get(row,"comment"),photo:"",conns:[],isMe:false,_cs:get(row,"connections")};
+    }).filter(Boolean);
+    const nti={};[...contacts,...newC].forEach(c=>{nti[c.name.trim().toLowerCase()]=c.id;});
+    newC.forEach(c=>{if(c._cs)c.conns=c._cs.split(",").map(n=>nti[n.trim().toLowerCase()]).filter(Boolean);delete c._cs;});
+    const ex=new Set(contacts.map(c=>c.name.trim().toLowerCase()));
+    const toAdd=newC.filter(c=>!ex.has(c.name.trim().toLowerCase()));
+    setContacts(p=>[...p,...toAdd]);
+    setResult({added:toAdd.length,skipped:newC.length-toAdd.length});setRows(null);
+  }
+  const FL={name:"Prénom / Nom *",lastName:"Nom de famille (si séparé)",role:"Rôle",company:"Entreprise",subCategory:"Sous-catégorie",cluster:"Cluster",priority:"Priorité (0-5)",email:"Email",phone:"Téléphone",comment:"Notes",connections:"Connexions (noms séparés par virgule)"};
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <div onDragOver={e=>{e.preventDefault();setDragI(true);}} onDragLeave={()=>setDragI(false)}
+        onDrop={e=>{e.preventDefault();setDragI(false);parse(e.dataTransfer.files[0]);}}
+        onClick={()=>ref.current?.click()}
+        style={{border:`1.5px dashed ${dragI?"#378ADD":"var(--cb2)"}`,borderRadius:"var(--br-lg)",padding:"32px 24px",textAlign:"center",cursor:"pointer",background:"var(--cbg2)"}}>
+        <div style={{fontSize:28,marginBottom:6}}>📂</div>
+        <p style={{margin:0,fontSize:14,fontWeight:500,color:"var(--ct)"}}>Déposer un fichier Excel ou CSV</p>
+        <p style={{margin:"4px 0 0",fontSize:12,color:"var(--ct3)"}}>.xlsx · .xls · .csv — Première ligne = en-têtes</p>
+        <input ref={ref} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={e=>parse(e.target.files[0])}/>
+      </div>
+      {result&&<div style={{padding:"10px 14px",borderRadius:"var(--br-md)",background:"#d4edda",color:"#155724",fontSize:13,display:"flex",justifyContent:"space-between"}}>
+        <span>✓ {result.added} importés{result.skipped?` · ${result.skipped} ignorés`:""}</span>
+        <span style={{cursor:"pointer",opacity:.6,fontSize:12}} onClick={()=>setResult(null)}>autre fichier</span>
+      </div>}
+      {rows&&<>
+        <div style={{border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",overflow:"hidden"}}>
+          <div style={{padding:"9px 14px",background:"var(--cbg2)",borderBottom:"0.5px solid var(--cb3)",fontSize:12,fontWeight:500,color:"var(--ct2)"}}>Correspondance des colonnes</div>
+          <div style={{padding:14,display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px 24px"}}>
+            {Object.entries(FL).map(([f,l])=>(
+              <div key={f} style={{display:"flex",alignItems:"center",gap:8}}>
+                <label style={{fontSize:12,color:"var(--ct2)",width:88,flexShrink:0}}>{l}</label>
+                <select value={mapping[f]} onChange={e=>setMapping(p=>({...p,[f]:e.target.value}))} style={{flex:1,fontSize:12}}>
+                  <option value="">— ignorer —</option>
+                  {headers.map(h=><option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+        </div>
+        <button onClick={doImport} disabled={!mapping.name}
+          style={{alignSelf:"flex-end",padding:"8px 20px",borderRadius:"var(--br-md)",border:"none",background:mapping.name?"var(--ct)":"var(--cbg2)",color:mapping.name?"var(--cbg1)":"var(--ct3)",fontSize:13,fontWeight:500,cursor:mapping.name?"pointer":"default",fontFamily:"inherit"}}>
+          Importer {rows.length} contacts ↗
+        </button>
+      </>}
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App({userId,onLogout}){
+  const cloudEnabled=!!supaClient&&!!userId;
+  const[clusters,setClusters]=useState(DEF_CLUSTERS);
+  const[contacts,setContacts]=useState(DEF_CONTACTS);
+  const[blacklist,setBlacklist]=useState(()=>new Set());
+  const[autoCompany,setAutoCompany]=useState(true);
+  const[autoCluster,setAutoCluster]=useState(false);
+  const[dbLoaded,setDbLoaded]=useState(false);
+  const[view,setView]=useState("contacts");
+  const[editClId,setEditClId]=useState(null);
+  const[showNewCl,setShowNewCl]=useState(false);
+  const[newClName,setNewClName]=useState("");
+  const[newClColor,setNewClColor]=useState("#E91E8C");
+  const[connFrom,setConnFrom]=useState("");
+  const[connTo,setConnTo]=useState("");
+  const[saveFlash,setSaveFlash]=useState(false);
+  const[isDirty,setIsDirty]=useState(false);
+  const[sortByPriority,setSortByPriority]=useState(false);
+  // undo/redo
+  const histRef=useRef([]);
+  const hidxRef=useRef(-1);
+  const skipRef=useRef(false);
+
+  const[cloudStatus,setCloudStatus]=useState(cloudEnabled?"loading":"off");
+  useEffect(()=>{
+    (async()=>{
+      let saved=null;
+      if(cloudEnabled){
+        saved=await cloudLoad(userId);
+        setCloudStatus(saved?"synced":"empty");
+      }
+      if(!saved)saved=await dbLoad();
+      if(saved){
+        if(saved.clusters)setClusters(saved.clusters);
+        if(saved.contacts)setContacts(saved.contacts);
+        if(saved.blacklist)setBlacklist(new Set(saved.blacklist));
+        if(saved.autoCompany!=null)setAutoCompany(saved.autoCompany);
+        if(saved.autoCluster!=null)setAutoCluster(saved.autoCluster);
+      }
+      setDbLoaded(true);
+    })();
+  },[]);
+
+  const autoTimer=useRef(null);
+  useEffect(()=>{
+    if(!dbLoaded)return;
+    // history
+    if(!skipRef.current){
+      const s={clusters:JSON.parse(JSON.stringify(clusters)),contacts:JSON.parse(JSON.stringify(contacts)),blacklist:[...blacklist],autoCompany,autoCluster};
+      histRef.current=histRef.current.slice(0,hidxRef.current+1);
+      histRef.current.push(s);
+      if(histRef.current.length>50)histRef.current.shift();
+      hidxRef.current=histRef.current.length-1;
+    }
+    // auto-save
+    clearTimeout(autoTimer.current);
+    autoTimer.current=setTimeout(async()=>{
+      const s={clusters,contacts,blacklist:[...blacklist],autoCompany,autoCluster};
+      dbSave(s);
+      if(cloudEnabled){const ok=await cloudSave(userId,s);setCloudStatus(ok?"synced":"error");}
+      setSaveFlash("auto");setTimeout(()=>setSaveFlash(false),1200);
+    },3000);
+    return()=>clearTimeout(autoTimer.current);
+  },[clusters,contacts,blacklist,autoCompany,autoCluster,dbLoaded]);
+
+  useEffect(()=>{
+    if(!dbLoaded)return;
+    const snap=snapshotKey({clusters,contacts,blacklist:[...blacklist],autoCompany,autoCluster});
+    setIsDirty(snap!==getLastBackupSnap());
+  },[clusters,contacts,blacklist,autoCompany,autoCluster,dbLoaded]);
+
+  useEffect(()=>{
+    function handler(e){
+      if(isDirty){e.preventDefault();e.returnValue="";return "";}
+    }
+    window.addEventListener("beforeunload",handler);
+    return()=>window.removeEventListener("beforeunload",handler);
+  },[isDirty]);
+
+  const canUndo=dbLoaded&&hidxRef.current>0;
+  const canRedo=dbLoaded&&hidxRef.current<histRef.current.length-1;
+  function applyHistory(idx){
+    const s=histRef.current[idx];
+    skipRef.current=true;
+    setClusters(s.clusters);setContacts(s.contacts);setBlacklist(new Set(s.blacklist));
+    setAutoCompany(s.autoCompany);setAutoCluster(s.autoCluster);
+    hidxRef.current=idx;
+    setTimeout(()=>{skipRef.current=false;},60);
+  }
+  function doUndo(){if(canUndo)applyHistory(hidxRef.current-1);}
+  function doRedo(){if(canRedo)applyHistory(hidxRef.current+1);}
+  useEffect(()=>{
+    function handler(e){
+      if((e.ctrlKey||e.metaKey)&&e.key==="z"&&!e.shiftKey){e.preventDefault();doUndo();}
+      if((e.ctrlKey||e.metaKey)&&(e.key==="y"||(e.key==="z"&&e.shiftKey))){e.preventDefault();doRedo();}
+    }
+    window.addEventListener("keydown",handler);
+    return()=>window.removeEventListener("keydown",handler);
+  });
+
+  const cmap=useMemo(()=>{const m={};clusters.forEach(cl=>{m[cl.id]=cl;});return m;},[clusters]);
+  const up=(id,f,v)=>setContacts(p=>p.map(c=>c.id===id?{...c,[f]:v}:c));
+  const addContact=()=>setContacts(p=>[...p,{id:uid(),name:"",role:"",company:"",subCategory:"",cluster:clusters[0]?.id||"cl1",priority:0,photo:"",email:"",phone:"",comment:"",conns:[],isMe:false}]);
+  const removeContact=id=>setContacts(p=>p.filter(c=>c.id!==id).map(c=>({...c,conns:c.conns.filter(x=>x!==id)})));
+  const setMe=id=>setContacts(p=>p.map(c=>({...c,isMe:c.id===id})));
+  const upCl=(id,f,v)=>setClusters(p=>p.map(cl=>cl.id===id?{...cl,[f]:v}:cl));
+  const removeCl=id=>{setClusters(p=>p.filter(cl=>cl.id!==id));if(editClId===id)setEditClId(null);};
+  const addCl=()=>{if(!newClName.trim())return;setClusters(p=>[...p,{id:uid(),name:newClName.trim(),color:newClColor}]);setNewClName("");setShowNewCl(false);};
+  const addManual=()=>{if(!connFrom||!connTo||connFrom===connTo)return;setContacts(p=>p.map(c=>{if(c.id===connFrom&&!c.conns.includes(connTo))return{...c,conns:[...c.conns,connTo]};if(c.id===connTo&&!c.conns.includes(connFrom))return{...c,conns:[...c.conns,connFrom]};return c;}));setConnFrom("");setConnTo("");};
+  const removeManual=(a,b)=>setContacts(p=>p.map(c=>{if(c.id===a)return{...c,conns:c.conns.filter(x=>x!==b)};if(c.id===b)return{...c,conns:c.conns.filter(x=>x!==a)};return c;}));
+  const toggleBL=(a,b)=>setBlacklist(prev=>{const k=bk(a,b),next=new Set(prev);next.has(k)?next.delete(k):next.add(k);return next;});
+  async function doSave(){
+    const s={clusters,contacts,blacklist:[...blacklist],autoCompany,autoCluster};
+    const ok=await dbSave(s);
+    if(cloudEnabled){const cok=await cloudSave(userId,s);setCloudStatus(cok?"synced":"error");}
+    setSaveFlash(ok?"saved":"err");setTimeout(()=>setSaveFlash(false),2000);
+  }
+  function doBackupNow(){const s={clusters,contacts,blacklist:[...blacklist],autoCompany,autoCluster};exportJSON(s);setLastBackupSnap(snapshotKey(s));setIsDirty(false);}
+  function doCSV(){const rows=[["Nom","Rôle","Entreprise","Sous-catégorie","Cluster","Priorité","Email","Téléphone","Notes","Connexions"]];contacts.forEach(c=>{rows.push([c.name,c.role,c.company,c.subCategory||"",cmap[c.cluster]?.name||"",c.priority||0,c.email,c.phone,c.comment||"",c.conns.map(id=>contacts.find(x=>x.id===id)?.name||"").filter(Boolean).join(", ")]);});const csv=rows.map(r=>r.map(cell=>`"${String(cell).replace(/"/g,'""')}"`).join(",")).join("\n");const b=new Blob(["﻿"+csv],{type:"text/csv;charset=utf-8;"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="netmap.csv";a.click();URL.revokeObjectURL(u);}
+  function doXLSX(){const rows=contacts.map(c=>({Nom:c.name,Rôle:c.role,Entreprise:c.company,"Sous-catégorie":c.subCategory||"",Cluster:cmap[c.cluster]?.name||"",Priorité:c.priority||0,Email:c.email,Téléphone:c.phone,Notes:c.comment||"",Connexions:c.conns.map(id=>contacts.find(x=>x.id===id)?.name||"").filter(Boolean).join(", ")}));const ws=XLSX.utils.json_to_sheet(rows);const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,"Réseau");XLSX.writeFile(wb,"netmap.xlsx");}
+
+  const gdata=useMemo(()=>{
+    const named=contacts.filter(c=>c.name.trim());
+    const seen=new Set();const links=[];
+    named.forEach(n=>n.conns.forEach(tid=>{const k=bk(n.id,tid);if(!seen.has(k)&&named.find(x=>x.id===tid)){seen.add(k);links.push({source:n.id,target:tid,type:"manual"});}}));
+    if(autoCompany){const byC={};named.filter(n=>n.company?.trim()).forEach(n=>{const co=n.company.trim().toLowerCase();if(!byC[co])byC[co]=[];byC[co].push(n);});Object.values(byC).forEach(arr=>{for(let i=0;i<arr.length;i++)for(let j=i+1;j<arr.length;j++){const k=bk(arr[i].id,arr[j].id);if(!seen.has(k)&&!blacklist.has(k)){seen.add(k);links.push({source:arr[i].id,target:arr[j].id,type:"company",label:arr[i].company});}}});}
+    if(autoCluster){const byC={};named.forEach(n=>{if(!byC[n.cluster])byC[n.cluster]=[];byC[n.cluster].push(n);});Object.entries(byC).forEach(([cl,arr])=>{for(let i=0;i<arr.length;i++)for(let j=i+1;j<arr.length;j++){const k=bk(arr[i].id,arr[j].id);if(!seen.has(k)&&!blacklist.has(k)){seen.add(k);links.push({source:arr[i].id,target:arr[j].id,type:"cluster",label:cmap[cl]?.name});}}});}
+    return{nodes:named,links};
+  },[contacts,autoCompany,autoCluster,blacklist,cmap]);
+
+  const allLinks=useMemo(()=>{
+    const res=[];const seen=new Set();
+    contacts.forEach(c=>c.conns.forEach(tid=>{const k=bk(c.id,tid);const t=contacts.find(x=>x.id===tid);if(!seen.has(k)&&t){seen.add(k);res.push({a:c,b:t,type:"manual"});}}));
+    if(autoCompany){const byC={};contacts.filter(n=>n.name.trim()&&n.company?.trim()).forEach(n=>{const co=n.company.trim().toLowerCase();if(!byC[co])byC[co]=[];byC[co].push(n);});Object.values(byC).forEach(arr=>{for(let i=0;i<arr.length;i++)for(let j=i+1;j<arr.length;j++){const k=bk(arr[i].id,arr[j].id);if(!seen.has(k)){seen.add(k);res.push({a:arr[i],b:arr[j],type:"company",disabled:blacklist.has(k)});}}});}
+    if(autoCluster){const byC={};contacts.filter(n=>n.name.trim()).forEach(n=>{if(!byC[n.cluster])byC[n.cluster]=[];byC[n.cluster].push(n);});Object.values(byC).forEach(arr=>{for(let i=0;i<arr.length;i++)for(let j=i+1;j<arr.length;j++){const k=bk(arr[i].id,arr[j].id);if(!seen.has(k)){seen.add(k);res.push({a:arr[i],b:arr[j],type:"cluster",disabled:blacklist.has(k)});}}});}
+    return res;
+  },[contacts,autoCompany,autoCluster,blacklist]);
+
+  const named=contacts.filter(c=>c.name.trim());
+  const editCl=clusters.find(cl=>cl.id===editClId);
+  const inCell=(val,id,field,ph,mono)=><input value={val} onChange={e=>up(id,field,e.target.value)} placeholder={ph} style={{width:"100%",border:"none",background:"transparent",color:"var(--ct)",outline:"none",fontSize:mono?11:13,fontFamily:mono?"monospace":"inherit"}}/>;
+  const btnBase={padding:"6px 11px",border:"0.5px solid var(--cb2)",borderRadius:"var(--br-md)",background:"transparent",fontSize:12,cursor:"pointer",fontFamily:"inherit"};
+  function Tab({t,label,count}){return<button onClick={()=>setView(t)} style={{padding:"6px 13px",border:"none",cursor:"pointer",fontSize:13,fontFamily:"inherit",borderRadius:"calc(var(--br-md) - 2px)",background:view===t?"var(--cbg1)":"transparent",color:view===t?"var(--ct)":"var(--ct2)",fontWeight:view===t?500:400,boxShadow:view===t?"0 .5px 2px rgba(0,0,0,.07)":"none",transition:"all .12s",display:"flex",alignItems:"center",gap:5}}>{label}{count!=null&&<span style={{fontSize:10,background:view===t?"var(--cbg2)":"#eee",color:"var(--ct3)",borderRadius:99,padding:"0 5px",minWidth:16,textAlign:"center"}}>{count}</span>}</button>;}
+
+  return(
+    <div style={{fontFamily:"inherit",display:"flex",flexDirection:"column",gap:14}}>
+      {/* header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+        <div style={{display:"flex",background:"var(--cbg2)",borderRadius:"var(--br-md)",padding:3,gap:2}}>
+          <Tab t="contacts" label="Contacts" count={named.length}/>
+          <Tab t="liens" label="Liens" count={gdata.links.length}/>
+          <Tab t="map" label="Carte"/>
+          <Tab t="import" label="Excel"/>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <div style={{display:"flex",gap:2}}>
+            <button onClick={doUndo} disabled={!canUndo} title="Annuler (Ctrl+Z)"
+              style={{width:30,height:30,border:"0.5px solid var(--cb2)",borderRadius:"var(--br-md)",background:"transparent",color:canUndo?"var(--ct)":"var(--cb2)",fontSize:16,cursor:canUndo?"pointer":"default",display:"flex",alignItems:"center",justifyContent:"center"}}>↶</button>
+            <button onClick={doRedo} disabled={!canRedo} title="Rétablir (Ctrl+Y)"
+              style={{width:30,height:30,border:"0.5px solid var(--cb2)",borderRadius:"var(--br-md)",background:"transparent",color:canRedo?"var(--ct)":"var(--cb2)",fontSize:16,cursor:canRedo?"pointer":"default",display:"flex",alignItems:"center",justifyContent:"center"}}>↷</button>
+          </div>
+          <button onClick={doCSV} style={{...btnBase,color:"var(--ct2)"}}>↓ CSV</button>
+          <button onClick={doXLSX} style={{...btnBase,color:"var(--ct2)"}}>↓ XLSX</button>
+          <button onClick={doSave} style={{padding:"6px 14px",border:"none",borderRadius:"var(--br-md)",background:saveFlash==="saved"?"#1D9E75":saveFlash==="auto"?"#378ADD":saveFlash==="err"?"#D8453A":"var(--ct)",color:"var(--cbg1)",fontSize:13,fontWeight:500,cursor:"pointer",fontFamily:"inherit",transition:"background .3s",minWidth:110,display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>
+            {saveFlash==="saved"?"✓ Sauvegardé":saveFlash==="auto"?"↺ Auto":saveFlash==="err"?"⚠ Erreur":"💾 Sauvegarder"}
+          </button>
+          {cloudEnabled&&<span title={cloudStatus==="synced"?"Synchronisé avec le cloud":cloudStatus==="error"?"Erreur de synchro cloud":"Synchronisation..."} style={{fontSize:14,color:cloudStatus==="synced"?"#1D9E75":cloudStatus==="error"?"#D8453A":"var(--ct3)"}}>{cloudStatus==="synced"?"☁":cloudStatus==="error"?"⚠":"⋯"}</span>}
+          {onLogout&&<button onClick={onLogout} title="Déconnexion" style={{...btnBase,color:"var(--ct3)"}}>⏻</button>}
+        </div>
+      </div>
+
+      {/* clusters */}
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center"}}>
+          {clusters.map(cl=>(
+            <div key={cl.id} onClick={()=>setEditClId(editClId===cl.id?null:cl.id)}
+              style={{display:"flex",alignItems:"center",gap:5,padding:"3px 10px",borderRadius:99,border:`1.5px solid ${cl.color}50`,background:cl.color+"14",cursor:"pointer",fontSize:12,fontWeight:500,color:cl.color,opacity:editClId&&editClId!==cl.id?.8:1}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:cl.color}}/>{cl.name}
+            </div>
+          ))}
+          <button onClick={()=>setShowNewCl(!showNewCl)}
+            style={{padding:"3px 10px",borderRadius:99,border:"1.5px dashed var(--cb2)",background:"transparent",color:"var(--ct3)",fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+            + Cluster
+          </button>
+        </div>
+        {showNewCl&&(
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"var(--cbg2)",borderRadius:"var(--br-md)",border:"0.5px solid var(--cb3)",flexWrap:"wrap"}}>
+            <input value={newClName} onChange={e=>setNewClName(e.target.value)} placeholder="Nom du cluster" onKeyDown={e=>e.key==="Enter"&&addCl()} style={{fontSize:13,border:"0.5px solid var(--cb2)",borderRadius:4,padding:"5px 10px",background:"var(--cbg1)",color:"var(--ct)",outline:"none",width:160}}/>
+            <input type="color" value={newClColor} onChange={e=>setNewClColor(e.target.value)} style={{width:30,height:26,border:"0.5px solid var(--cb2)",borderRadius:4,cursor:"pointer",padding:2}}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>{PALETTE.map(c=><div key={c} onClick={()=>setNewClColor(c)} style={{width:16,height:16,borderRadius:"50%",background:c,cursor:"pointer",border:newClColor===c?"2.5px solid var(--ct)":"none"}}/>)}</div>
+            <button onClick={addCl} disabled={!newClName.trim()} style={{padding:"5px 14px",border:"none",borderRadius:6,background:newClName.trim()?"var(--ct)":"var(--cbg2)",color:newClName.trim()?"var(--cbg1)":"var(--ct3)",fontSize:12,cursor:newClName.trim()?"pointer":"default",fontFamily:"inherit"}}>Créer</button>
+            <button onClick={()=>setShowNewCl(false)} style={{border:"none",background:"none",cursor:"pointer",color:"var(--ct3)",fontSize:18,marginLeft:"auto"}}>×</button>
+          </div>
+        )}
+        {editCl&&(
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"var(--cbg2)",borderRadius:"var(--br-md)",border:"0.5px solid var(--cb3)",flexWrap:"wrap"}}>
+            <span style={{fontSize:11,fontWeight:500,color:"var(--ct2)"}}>Modifier :</span>
+            <input value={editCl.name} onChange={e=>upCl(editCl.id,"name",e.target.value)} style={{fontSize:13,border:"0.5px solid var(--cb2)",borderRadius:4,padding:"5px 10px",background:"var(--cbg1)",color:"var(--ct)",outline:"none",width:140}}/>
+            <input type="color" value={editCl.color} onChange={e=>upCl(editCl.id,"color",e.target.value)} style={{width:30,height:26,border:"0.5px solid var(--cb2)",borderRadius:4,cursor:"pointer",padding:2}}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>{PALETTE.map(c=><div key={c} onClick={()=>upCl(editCl.id,"color",c)} style={{width:16,height:16,borderRadius:"50%",background:c,cursor:"pointer",border:editCl.color===c?"2.5px solid var(--ct)":"none"}}/>)}</div>
+            <button onClick={()=>removeCl(editCl.id)} style={{marginLeft:"auto",border:"0.5px solid var(--cb2)",borderRadius:6,background:"transparent",color:"var(--ct3)",fontSize:11,cursor:"pointer",padding:"4px 10px",fontFamily:"inherit"}}>Supprimer</button>
+            <button onClick={()=>setEditClId(null)} style={{border:"none",background:"none",cursor:"pointer",color:"var(--ct3)",fontSize:18,lineHeight:1}}>×</button>
+          </div>
+        )}
+      </div>
+
+      {/* CONTACTS */}
+      {view==="contacts"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <div style={{display:"flex",justifyContent:"flex-end"}}>
+            <Toggle val={sortByPriority} onChange={setSortByPriority} label="Trier par importance"/>
+          </div>
+          <div style={{overflowX:"auto",border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+              <thead><tr style={{background:"var(--cbg2)",borderBottom:"0.5px solid var(--cb3)"}}>
+                {["","Nom","Rôle","Entreprise","Sous-catégorie","Cluster","Priorité","Email","Téléphone","Notes","★",""].map((h,i)=><th key={i} style={{padding:"8px 10px",textAlign:"left",fontSize:11,fontWeight:500,color:"var(--ct2)",whiteSpace:"nowrap"}}>{h}</th>)}
+              </tr></thead>
+              <tbody>{(sortByPriority?[...contacts].sort((a,b)=>(b.priority||0)-(a.priority||0)):contacts).map((c,idx,arr)=>{
+                const cl=cmap[c.cluster]||{color:"#888"};
+                const ini=c.name.trim().split(/\s+/).map(w=>w[0]).join("").slice(0,2).toUpperCase()||"?";
+                return<tr key={c.id} style={{borderBottom:idx<arr.length-1?"0.5px solid var(--cb3)":"none",background:c.isMe?cl.color+"07":"transparent"}}>
+                  <td style={{padding:"6px 10px"}}><Avatar photo={c.photo} color={cl.color} initials={ini} onChange={v=>up(c.id,"photo",v)}/></td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.name,c.id,"name","Nom Prénom",false)}</td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.role,c.id,"role","Rôle",false)}</td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.company,c.id,"company","Entreprise",false)}</td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.subCategory||"",c.id,"subCategory","Secteur, école...",false)}</td>
+                  <td style={{padding:"6px 10px"}}>
+                    <select value={c.cluster} onChange={e=>up(c.id,"cluster",e.target.value)} style={{border:"none",background:"transparent",color:cl.color,fontWeight:500,fontSize:12,cursor:"pointer"}}>
+                      {clusters.map(cl2=><option key={cl2.id} value={cl2.id}>{cl2.name}</option>)}
+                    </select>
+                  </td>
+                  <td style={{padding:"6px 10px"}}><StarRating val={c.priority||0} onChange={v=>up(c.id,"priority",v)}/></td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.email,c.id,"email","email@...",true)}</td>
+                  <td style={{padding:"6px 10px"}}>{inCell(c.phone,c.id,"phone","+33...",true)}</td>
+                  <td style={{padding:"6px 10px",minWidth:180}}>
+                    <textarea value={c.comment||""} onChange={e=>up(c.id,"comment",e.target.value)} placeholder="Prénom des enfants, anniversaire, comment on s'est rencontrés..." rows={2}
+                      style={{width:"100%",border:"none",background:"transparent",color:"var(--ct)",outline:"none",fontSize:12,fontFamily:"inherit",resize:"vertical",minHeight:20}}/>
+                  </td>
+                  <td style={{padding:"6px 6px",textAlign:"center"}}><button onClick={()=>setMe(c.id)} title="Nœud central de la carte" style={{border:"none",background:"none",cursor:"pointer",fontSize:14,opacity:c.isMe?1:.18,color:cl.color,transition:"opacity .15s"}}>◎</button></td>
+                  <td style={{padding:"6px 6px",textAlign:"center"}}><button onClick={()=>removeContact(c.id)} style={{border:"none",background:"none",cursor:"pointer",color:"var(--ct3)",fontSize:16,lineHeight:1}}>×</button></td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <button onClick={addContact} style={{...btnBase,color:"var(--ct)"}}>+ Contact</button>
+            <span style={{fontSize:11,color:"var(--ct3)"}}>◎ = nœud central · ★ = importance · Photo : glisser ou cliquer</span>
+          </div>
+        </div>
+      )}
+
+      {/* LIENS */}
+      {view==="liens"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"11px 14px",border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",background:"var(--cbg2)",flexWrap:"wrap"}}>
+            <span style={{fontSize:12,fontWeight:500,color:"var(--ct2)",marginRight:4}}>Liens auto :</span>
+            <Toggle val={autoCompany} onChange={setAutoCompany} label="Même entreprise"/>
+            <Toggle val={autoCluster} onChange={setAutoCluster} label="Même cluster"/>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"11px 14px",border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",flexWrap:"wrap"}}>
+            <span style={{fontSize:12,fontWeight:500,color:"var(--ct2)"}}>Lien manuel :</span>
+            <select value={connFrom} onChange={e=>setConnFrom(e.target.value)} style={{flex:1,minWidth:130,fontSize:13}}><option value="">Personne A…</option>{named.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
+            <span style={{color:"var(--ct3)",fontSize:18}}>↔</span>
+            <select value={connTo} onChange={e=>setConnTo(e.target.value)} style={{flex:1,minWidth:130,fontSize:13}}><option value="">Personne B…</option>{named.filter(c=>c.id!==connFrom).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
+            <button onClick={addManual} disabled={!connFrom||!connTo||connFrom===connTo}
+              style={{padding:"7px 14px",border:"none",borderRadius:"var(--br-md)",background:connFrom&&connTo&&connFrom!==connTo?"var(--ct)":"var(--cbg2)",color:connFrom&&connTo&&connFrom!==connTo?"var(--cbg1)":"var(--ct3)",fontSize:13,fontWeight:500,cursor:connFrom&&connTo&&connFrom!==connTo?"pointer":"default",fontFamily:"inherit"}}>
+              Créer
+            </button>
+          </div>
+          {allLinks.length===0
+            ?<div style={{textAlign:"center",padding:"32px 20px",color:"var(--ct3)",fontSize:13,border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",background:"var(--cbg2)"}}>Aucun lien · activez les règles auto ou créez un lien manuel</div>
+            :<div style={{border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",overflow:"hidden"}}>
+              {["manual","company","cluster"].map(type=>{
+                const group=allLinks.filter(l=>l.type===type);if(!group.length)return null;
+                const tc=type==="manual"?"var(--ct)":type==="company"?"#378ADD":"#EF9F27";
+                const tl=type==="manual"?"Liens manuels":type==="company"?"Même entreprise":"Même cluster";
+                return<div key={type}>
+                  <div style={{padding:"7px 14px",background:"var(--cbg2)",borderBottom:"0.5px solid var(--cb3)",display:"flex",alignItems:"center",gap:8}}>
+                    <svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke={tc} strokeWidth={type==="manual"?2:1.2} strokeDasharray={type==="cluster"?"4 3":"none"}/></svg>
+                    <span style={{fontSize:11,fontWeight:600,color:tc,letterSpacing:".03em"}}>{tl}</span>
+                    <span style={{fontSize:11,color:"var(--ct3)",marginLeft:2}}>— {group.length} lien{group.length>1?"s":""}</span>
+                  </div>
+                  {group.map(({a,b,disabled},i)=>{
+                    const isAuto=type!=="manual";const k=bk(a.id,b.id);
+                    return<div key={k} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 14px",borderBottom:i<group.length-1?"0.5px solid var(--cb3)":"none",opacity:disabled?.4:1}}>
+                      <NodeBadge c={a} cmap={cmap}/>
+                      <svg width="24" height="8" style={{flexShrink:0}}><line x1="0" y1="4" x2="24" y2="4" stroke={tc} strokeWidth={type==="manual"?2:1.2} strokeDasharray={type==="cluster"?"4 3":"none"}/></svg>
+                      <NodeBadge c={b} cmap={cmap}/>
+                      {isAuto
+                        ?<button onClick={()=>toggleBL(a.id,b.id)} style={{border:"0.5px solid var(--cb2)",background:"none",cursor:"pointer",color:disabled?"#378ADD":"var(--ct3)",fontSize:11,padding:"3px 8px",borderRadius:5,flexShrink:0,fontFamily:"inherit",whiteSpace:"nowrap"}}>{disabled?"Réactiver":"Masquer"}</button>
+                        :<button onClick={()=>removeManual(a.id,b.id)} style={{border:"none",background:"none",cursor:"pointer",color:"var(--ct3)",fontSize:16,padding:"0 4px",flexShrink:0}}>×</button>}
+                    </div>;
+                  })}
+                </div>;
+              })}
+            </div>}
+        </div>
+      )}
+
+      {view==="map"&&<MapView gdata={gdata} cmap={cmap}/>}
+      {view==="import"&&<ImportView contacts={contacts} setContacts={setContacts} clusters={clusters}/>}
+      <BackupBanner isDirty={isDirty} onBackup={doBackupNow}/>
+    </div>
+  );
+}
+
+// ─── Root ─────────────────────────────────────────────────────────────────────
+function BackupBanner({isDirty,onBackup}){
+  const ref=useRef(null);
+  function doRestore(f){if(!f)return;const r=new FileReader();r.onload=e=>{try{const d=JSON.parse(e.target.result);dbSave(d).then(()=>{window.location.reload();});}catch{alert("Fichier invalide");}};r.readAsText(f);}
+  const bg=isDirty?"#FDEDEC":"#EDF9F3";
+  const bd=isDirty?"#F0B4AC":"#B9E4D0";
+  const dot=isDirty?"#D8453A":"#1D9E75";
+  const label=isDirty?"Modifications non sauvegardées — pense à faire un backup JSON avant de fermer":"Backup JSON à jour";
+  return(
+    <div style={{marginTop:32,padding:"10px 14px",borderRadius:"var(--br-md)",background:bg,border:`1px solid ${bd}`,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+      <span style={{fontSize:11.5,color:"#444",display:"flex",alignItems:"center",gap:7}}>
+        <span style={{width:7,height:7,borderRadius:"50%",background:dot,flexShrink:0,display:"inline-block"}}/>
+        {label}
+      </span>
+      <div style={{display:"flex",gap:6}}>
+        <button onClick={onBackup} style={{background:isDirty?"#D8453A":"transparent",color:isDirty?"#fff":"#1D9E75",border:"1px solid "+(isDirty?"#D8453A":"#1D9E7540"),borderRadius:6,padding:"5px 12px",fontSize:11,fontWeight:isDirty?600:400,cursor:"pointer",fontFamily:"inherit",transition:"all .15s"}}>↓ Backup JSON{isDirty?" maintenant":""}</button>
+        <button onClick={()=>ref.current?.click()} style={{background:"transparent",color:"#378ADD",border:"1px solid #378ADD40",borderRadius:6,padding:"5px 12px",fontSize:11,cursor:"pointer",fontFamily:"inherit",transition:"all .15s"}}>↑ Restaurer</button>
+        <input ref={ref} type="file" accept=".json" style={{display:"none"}} onChange={e=>doRestore(e.target.files[0])}/>
+      </div>
+    </div>
+  );
+}
+function Logo(){
+  return (
+    <h1 style={{fontSize:18,fontWeight:600,margin:"0 0 18px",color:"var(--ct)",display:"flex",alignItems:"center",gap:11,lineHeight:1}}>
+      <svg width="38" height="38" viewBox="0 0 38 38" fill="none">
+        <path d="M19 2.5L33.5 10.75L33.5 27.25L19 35.5L4.5 27.25L4.5 10.75Z" fill="#111"/>
+        <circle cx="19" cy="19" r="3.1" fill="white"/>
+        <circle cx="19" cy="11" r="2.1" fill="white"/>
+        <circle cx="13" cy="25.4" r="2.1" fill="white"/>
+        <circle cx="25" cy="25.4" r="2.1" fill="white"/>
+        <line x1="19" y1="13.1" x2="19" y2="15.9" stroke="white" strokeWidth="1.7" strokeLinecap="round"/>
+        <line x1="16.3" y1="20.8" x2="14.4" y2="23.6" stroke="white" strokeWidth="1.7" strokeLinecap="round"/>
+        <line x1="21.7" y1="20.8" x2="23.6" y2="23.6" stroke="white" strokeWidth="1.7" strokeLinecap="round"/>
+      </svg>
+      <span style={{display:"flex",flexDirection:"column",gap:2}}>
+        NetMap
+        <small style={{fontSize:"8.5px",fontWeight:400,color:"#bbb",letterSpacing:".5px",textTransform:"uppercase"}}>ma cartographie réseau</small>
+      </span>
+    </h1>
+  );
+}
+
+// ─── AuthGate ─────────────────────────────────────────────────────────────────
+function LoginForm({onSignedIn}){
+  const[email,setEmail]=useState("");
+  const[password,setPassword]=useState("");
+  const[err,setErr]=useState("");
+  const[busy,setBusy]=useState(false);
+  async function submit(e){
+    e.preventDefault();
+    setErr("");setBusy(true);
+    const{data,error}=await supaClient.auth.signInWithPassword({email,password});
+    setBusy(false);
+    if(error){setErr("Connexion refusée : "+error.message);return;}
+    onSignedIn(data.session);
+  }
+  return (
+    <div style={{maxWidth:340,margin:"80px auto",display:"flex",flexDirection:"column",gap:16}}>
+      <Logo/>
+      <form onSubmit={submit} style={{display:"flex",flexDirection:"column",gap:10,border:"0.5px solid var(--cb3)",borderRadius:"var(--br-lg)",padding:20,background:"var(--cbg1)"}}>
+        <label style={{fontSize:12,color:"var(--ct2)"}}>Email
+          <input type="email" required value={email} onChange={e=>setEmail(e.target.value)} style={{display:"block",width:"100%",marginTop:4,fontSize:14,border:"0.5px solid var(--cb2)",borderRadius:6,padding:"8px 10px",background:"var(--cbg2)",color:"var(--ct)",outline:"none"}}/>
+        </label>
+        <label style={{fontSize:12,color:"var(--ct2)"}}>Mot de passe
+          <input type="password" required value={password} onChange={e=>setPassword(e.target.value)} style={{display:"block",width:"100%",marginTop:4,fontSize:14,border:"0.5px solid var(--cb2)",borderRadius:6,padding:"8px 10px",background:"var(--cbg2)",color:"var(--ct)",outline:"none"}}/>
+        </label>
+        {err&&<div style={{fontSize:12,color:"#D8453A"}}>{err}</div>}
+        <button type="submit" disabled={busy} style={{padding:"9px 14px",border:"none",borderRadius:6,background:"var(--ct)",color:"var(--cbg1)",fontSize:13,fontWeight:500,cursor:busy?"default":"pointer",fontFamily:"inherit"}}>{busy?"Connexion...":"Se connecter"}</button>
+      </form>
+      <p style={{fontSize:11,color:"var(--ct3)",textAlign:"center",margin:0}}>Compte créé manuellement dans Supabase (voir SETUP.md).</p>
+    </div>
+  );
+}
+function AuthGate(){
+  const[session,setSession]=useState(null);
+  const[ready,setReady]=useState(false);
+  useEffect(()=>{
+    if(!supaClient){setReady(true);return;}
+    supaClient.auth.getSession().then(({data})=>{setSession(data.session);setReady(true);});
+    const{data:sub}=supaClient.auth.onAuthStateChange((_event,s)=>setSession(s));
+    return()=>sub.subscription.unsubscribe();
+  },[]);
+  if(!supaClient){
+    return(<>
+      <Logo/>
+      <div style={{marginBottom:14,padding:"9px 14px",borderRadius:"var(--br-md)",background:"#FFF6E5",border:"1px solid #F0D48A",fontSize:12,color:"#7A5A00"}}>
+        Synchro cloud désactivée — SUPABASE_URL / SUPABASE_ANON_KEY non configurées (voir SETUP.md). L'app fonctionne en local sur cet appareil uniquement.
+      </div>
+      <App/>
+    </>);
+  }
+  if(!ready)return <div style={{padding:60,textAlign:"center",color:"var(--ct3)"}}>Chargement...</div>;
+  if(!session)return <LoginForm onSignedIn={setSession}/>;
+  return (<>
+    <Logo/>
+    <App userId={session.user.id} onLogout={()=>supaClient.auth.signOut()}/>
+  </>);
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<AuthGate/>);
+  </script>
+</body>
+</html>
