@@ -60,8 +60,8 @@ function setLastBackupSnap(v){try{localStorage.setItem("nm_last_backup_snap",v);
 // 1. Crée un projet gratuit sur https://supabase.com
 // 2. Colle ici l'URL du projet et sa clé "anon public" (Project Settings > API)
 // 3. Suis le fichier SETUP.md à la racine du repo pour créer la table + l'utilisateur
-const SUPABASE_URL = "";
-const SUPABASE_ANON_KEY = "";
+const SUPABASE_URL = "https://bufewpvgjewfsksyyusx.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ1ZmV3cHZnamV3ZnNrc3l5dXN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYxOTU5OTIsImV4cCI6MjEwMTc3MTk5Mn0.fCBAx7fOPdhxEyP_IJhoJUP7pJDDlA2gXe3d7lGwKIg";
 const supaClient = (SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
   : null;
