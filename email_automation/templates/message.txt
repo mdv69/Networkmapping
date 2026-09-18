@@ -1,0 +1,7 @@
+Bonjour $nom,
+
+Je me permets de vous contacter au sujet de $entreprise.
+
+[Personnalisez ici votre message...]
+
+Cordialement,
