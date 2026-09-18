@@ -31,7 +31,10 @@ def main():
         subject, body = build_message(template_text, args.subject, contact)
         lines.append("=" * 70)
         lines.append(f"[{i}/{len(contacts)}] {contact.get('entreprise', '')} - {contact.get('nom', '')}")
-        lines.append(f"A : {contact['email']}")
+        email_line = f"A : {contact['email']}"
+        if contact.get("email_devine", "").startswith("OUI"):
+            email_line += "   >>> EMAIL DEVINE, A VERIFIER AVANT ENVOI <<<"
+        lines.append(email_line)
         lines.append(f"Objet : {subject}")
         lines.append("-" * 70)
         lines.append(body)
