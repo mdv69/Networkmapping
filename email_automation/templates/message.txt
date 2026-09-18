@@ -1,7 +1,12 @@
-Bonjour $nom,
+Bonjour $prenom,
 
-Je me permets de vous contacter au sujet de $entreprise.
+Je m'appelle Malo Dufour, actuellement en formation et a la recherche d'une experience de deux mois a Paris (novembre-decembre 2026) dans le secteur de la finance de marche. J'ai recemment termine un stage en trading petrolier et j'ai egalement participe au lancement d'un hedge fund, une experience qui m'a donne un gout prononce pour les marches et une approche entrepreneuriale.
 
-[Personnalisez ici votre message...]
+Votre poste de $poste chez $entreprise, notamment autour de $secteur, correspond tres directement a ce que je recherche.
 
-Cordialement,
+Seriez-vous disponible pour un bref echange (15-20 minutes, en personne ou par visio) afin de discuter d'une eventuelle opportunite au sein de vos equipes sur cette periode ?
+
+Je me tiens a votre disposition et vous remercie par avance pour votre temps.
+
+Bien cordialement,
+Malo Dufour
