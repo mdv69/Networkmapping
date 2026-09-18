@@ -1,12 +1,12 @@
-Bonjour $prenom,
+Bonjour $nom,
 
-Je m'appelle Malo Dufour, actuellement en formation et a la recherche d'une experience de deux mois a Paris (novembre-decembre 2026) dans le secteur de la finance de marche. J'ai recemment termine un stage en trading petrolier et j'ai egalement participe au lancement d'un hedge fund, une experience qui m'a donne un gout prononce pour les marches et une approche entrepreneuriale.
+Je me permets de vous contacter car je suis actuellement en stage en trading pétrolier, une expérience qui se termine fin octobre. Avant de débuter une nouvelle expérience plus long terme en janvier, j'aimerais profiter des mois de novembre et décembre pour découvrir une nouvelle équipe en finance à Paris.
 
-Votre poste de $poste chez $entreprise, notamment autour de $secteur, correspond tres directement a ce que je recherche.
+Diplômé récemment de mon MSc à UCL, je suis aussi impliqué dans le lancement d'un hedge fund spécialisé sur les options US, avec un rôle transverse allant de la structuration du fonds à la préparation des supports investisseurs, en passant par le fundraising et les échanges avec investisseurs, family offices et partenaires financiers.
 
-Seriez-vous disponible pour un bref echange (15-20 minutes, en personne ou par visio) afin de discuter d'une eventuelle opportunite au sein de vos equipes sur cette periode ?
+Je serais donc très intéressé par la possibilité de rejoindre $entreprise pendant un ou deux mois, sous forme de stage ou de mission courte, y compris non rémunérée. Une telle expérience me permettrait de continuer à approfondir ma compréhension des métiers de la finance, de découvrir un nouvel environnement et de compléter utilement mon parcours avant janvier.
 
-Je me tiens a votre disposition et vous remercie par avance pour votre temps.
+Je serais ravi d'échanger avec vous à ce sujet.
 
 Bien cordialement,
 Malo Dufour
