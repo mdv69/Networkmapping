@@ -1,4 +1,4 @@
-Bonjour $nom,
+Bonjour $civilite $nom_famille,
 
 Je me permets de vous contacter car je suis actuellement en stage en trading pétrolier, une expérience qui se termine fin octobre. Avant de débuter une nouvelle expérience plus long terme en janvier, j'aimerais profiter des mois de novembre et décembre pour découvrir une nouvelle équipe en finance à Paris.
 

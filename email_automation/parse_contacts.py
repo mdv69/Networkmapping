@@ -13,12 +13,29 @@ Usage:
 import argparse
 import csv
 import re
+import unicodedata
 
+import gender_guesser.detector as gender
 import pandas as pd
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 CONTACT_COLUMNS = ["Contact public", "Contact public2"]
+
+_gender_detector = gender.Detector()
+
+
+def guess_civilite(prenom):
+    """Renvoie 'Monsieur', 'Madame' ou '' (incertain, a completer manuellement)."""
+    if not prenom:
+        return ""
+    ascii_prenom = unicodedata.normalize("NFKD", prenom).encode("ascii", "ignore").decode()
+    result = _gender_detector.get_gender(ascii_prenom)
+    if result in ("male", "mostly_male"):
+        return "Monsieur"
+    if result in ("female", "mostly_female"):
+        return "Madame"
+    return ""
 
 
 def parse_contact_field(raw):
@@ -62,11 +79,16 @@ def main():
                 if email_key in seen_emails:
                     continue
                 seen_emails.add(email_key)
+                name_parts = nom.split()
+                prenom = name_parts[0] if name_parts else ""
+                nom_famille = name_parts[-1] if len(name_parts) >= 2 else ""
                 rows.append({
                     "email": email,
                     "entreprise": row.get("Organisation", ""),
                     "nom": nom,
-                    "prenom": nom.split()[0] if nom else "",
+                    "prenom": prenom,
+                    "nom_famille": nom_famille,
+                    "civilite": guess_civilite(prenom),
                     "poste": poste or row.get("Fonction", ""),
                     "secteur": row.get("Sous-secteur / équipe cible", ""),
                     "pourquoi_pertinent": row.get("Pourquoi pertinent", ""),
@@ -74,13 +96,18 @@ def main():
                     "feuille": sheet,
                 })
 
-    fieldnames = ["email", "entreprise", "nom", "prenom", "poste", "secteur", "pourquoi_pertinent", "priorite", "feuille"]
+    fieldnames = ["email", "entreprise", "nom", "prenom", "nom_famille", "civilite", "poste", "secteur", "pourquoi_pertinent", "priorite", "feuille"]
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
+    uncertain = [r["nom"] for r in rows if not r["civilite"]]
     print(f"{len(rows)} contact(s) avec email extrait(s) -> {args.out}")
+    if uncertain:
+        print(f"\nATTENTION : civilite incertaine pour {len(uncertain)} contact(s), a completer manuellement dans le CSV avant envoi :")
+        for n in uncertain:
+            print(f"  - {n}")
 
 
 if __name__ == "__main__":
